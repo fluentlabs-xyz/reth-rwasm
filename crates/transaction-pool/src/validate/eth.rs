@@ -643,17 +643,13 @@ where
             }
         }
 
-        // For fluent EIP-7825 is forcibly disabled, because of Wasm binaries that might exceed 16
-        // mil input size
-        let is_fluent = self.chain_id() == 1337 ||
-            self.chain_id() == 0x5201 ||
-            self.chain_id() == 0x5202 ||
-            self.chain_id() == 25363;
-
-        // Transaction gas limit validation (EIP-7825 for Osaka+)
+        // Transaction gas limit validation (EIP-7825 for Osaka+). On Fluent the cap is whatever
+        // the EVM configuration carries (`CfgEnv::tx_gas_limit_cap`): the chain sets its own value
+        // rather than the fixed 2^24, so the pool follows the configuration instead of skipping
+        // the check and admitting transactions that block validation rejects.
         let tx_gas_limit_cap =
             self.fork_tracker.tx_gas_limit_cap.load(std::sync::atomic::Ordering::Relaxed);
-        if !is_fluent && tx_gas_limit_cap > 0 && transaction.gas_limit() > tx_gas_limit_cap {
+        if tx_gas_limit_cap > 0 && transaction.gas_limit() > tx_gas_limit_cap {
             return Err(InvalidTransactionError::GasLimitTooHigh.into())
         }
 
