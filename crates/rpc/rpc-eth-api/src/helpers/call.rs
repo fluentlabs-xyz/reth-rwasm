@@ -3,13 +3,15 @@
 
 use core::fmt;
 
-use super::{LoadBlock, LoadPendingBlock, LoadState, LoadTransaction, SpawnBlocking, Trace};
+use super::{
+    overrides::{apply_block_overrides, apply_state_overrides, OverrideBlockHashes},
+    LoadBlock, LoadPendingBlock, LoadState, LoadTransaction, SpawnBlocking, Trace,
+};
 use crate::{
     helpers::estimate::EstimateCall, FromEvmError, FullEthApiTypes, RpcBlock, RpcNodeCore,
 };
 use alloy_consensus::{transaction::TxHashRef, BlockHeader};
 use alloy_eips::eip2930::AccessListResult;
-use alloy_evm::overrides::{apply_block_overrides, apply_state_overrides, OverrideBlockHashes};
 use alloy_network::TransactionBuilder;
 use alloy_primitives::{Bytes, B256, U256};
 use alloy_rpc_types_eth::{
@@ -44,7 +46,10 @@ use reth_storage_api::{BlockIdReader, ProviderTx, StateProvider};
 use reth_tasks::CancelOnDrop;
 use revm::{
     context::Block,
-    context_interface::{result::ResultAndState, Cfg, Transaction},
+    context_interface::{
+        result::{ExecutionResult, Output, ResultAndState},
+        Cfg, Transaction,
+    },
     Database, DatabaseCommit,
 };
 use revm_inspectors::{access_list::AccessListInspector, transfer::TransferInspector};
@@ -78,7 +83,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
     ) -> impl Future<Output = SimulatedBlocksResult<Self::NetworkTypes, Self::Error>> + Send {
         async move {
             if payload.block_state_calls.len() > self.max_simulate_blocks() as usize {
-                return Err(EthApiError::other(EthSimulateError::TooManyBlocks).into())
+                return Err(EthApiError::other(EthSimulateError::TooManyBlocks).into());
             }
 
             let block = block.unwrap_or_default();
@@ -91,7 +96,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
             } = payload;
 
             if block_state_calls.is_empty() {
-                return Err(EthApiError::InvalidParams(String::from("calls are empty.")).into())
+                return Err(EthApiError::InvalidParams(String::from("calls are empty.")).into());
             }
 
             let permit = self
@@ -348,7 +353,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                     .block_hash_for_id(target_block)
                     .map_err(Self::Error::from_eth_err::<ProviderError>)?
                 else {
-                    return Err(EthApiError::HeaderNotFound(target_block).into())
+                    return Err(EthApiError::HeaderNotFound(target_block).into());
                 };
                 target_block = block_hash.into();
             }
@@ -571,8 +576,8 @@ pub trait Call:
         DB: Database<Error = EvmDatabaseError<ProviderError>> + fmt::Debug,
     {
         let mut evm = self.evm_config().evm_with_env(db, evm_env);
-        let res = evm.transact(tx_env).map_err(Self::Error::from_evm_err)?;
-
+        let mut res = evm.transact(tx_env.clone()).map_err(Self::Error::from_evm_err)?;
+        self.restore_create_output(&mut res, &tx_env);
         Ok(res)
     }
 
@@ -590,9 +595,41 @@ pub trait Call:
         I: InspectorFor<Self::Evm, DB>,
     {
         let mut evm = self.evm_config().evm_with_env_and_inspector(db, evm_env, inspector);
-        let res = evm.transact(tx_env).map_err(Self::Error::from_evm_err)?;
+        let mut res = evm.transact(tx_env.clone()).map_err(Self::Error::from_evm_err)?;
+        self.restore_create_output(&mut res, &tx_env);
 
         Ok(res)
+    }
+
+    /// Restores runtime bytecode to output for contract creations during simulation calls.
+    /// Needed because we store bytecode in state but return empty bytes by default.
+    fn restore_create_output(
+        &self,
+        res: &mut ResultAndState<HaltReasonFor<Self::Evm>>,
+        tx_env: &TxEnvFor<Self::Evm>,
+    ) {
+        if res.result.is_success() && tx_env.kind().is_create() {
+            let Some(addr) = res.result.created_address() else { return };
+            let Some(account) = res.state.get(&addr) else { return };
+            let Some(code) = account.info.code.as_ref() else { return };
+
+            let runtime_code = match code {
+                reth_revm::bytecode::Bytecode::OwnableAccount(acc)
+                    if acc.owner_address == fluentbase_types::PRECOMPILE_EVM_RUNTIME =>
+                {
+                    fluentbase_evm::EthereumMetadata::read_from_bytes(&acc.metadata)
+                        .map(|m| m.code_copy())
+                }
+                _ => None,
+            };
+
+            if let Some(bytes) = runtime_code &&
+                let ExecutionResult::Success { output: Output::Create(out, ..), .. } =
+                    &mut res.result
+            {
+                *out = bytes;
+            }
+        }
     }
 
     /// Executes the call request at the given [`BlockId`].
@@ -624,7 +661,7 @@ pub trait Call:
                     let _permit = permit;
                     if cancel.is_cancelled() {
                         // callsite dropped the guard
-                        return Err(EthApiError::InternalEthError.into())
+                        return Err(EthApiError::InternalEthError.into());
                     }
                     this.transact(db, evm_env, tx_env)
                 })
@@ -797,7 +834,7 @@ pub trait Call:
         for (index, tx) in transactions.into_iter().enumerate() {
             if index == target_tx_index {
                 // reached the target transaction
-                break
+                break;
             }
 
             let tx_env = self.evm_config().tx_env(tx);

@@ -164,19 +164,26 @@ impl<Api: Clone> EngineSszProxyHandle<Api> {
 #[derive(Clone, Debug)]
 pub struct EngineSszProxyLayer<Api = ()> {
     handle: EngineSszProxyHandle<Api>,
+    enabled: bool,
 }
 
 impl<Api> EngineSszProxyLayer<Api> {
     /// Creates a new proxy layer and a handle for setting the engine after node launch.
     pub fn new() -> (Self, EngineSszProxyHandle<Api>) {
         let handle = EngineSszProxyHandle::new();
-        (Self { handle: handle.clone() }, handle)
+        (Self { handle: handle.clone(), enabled: true }, handle)
+    }
+
+    /// Enables the SSZ transport. Disabled routes return 404 so clients use JSON-RPC.
+    pub const fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
     }
 
     /// Creates a new proxy layer with an Engine API implementation.
     pub fn with_engine_api(engine_api: Api) -> (Self, EngineSszProxyHandle<Api>) {
         let handle = EngineSszProxyHandle::with_engine_api(engine_api);
-        (Self { handle: handle.clone() }, handle)
+        (Self { handle: handle.clone(), enabled: true }, handle)
     }
 }
 
@@ -184,7 +191,7 @@ impl<S, Api> Layer<S> for EngineSszProxyLayer<Api> {
     type Service = EngineSszProxyService<S, Api>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        EngineSszProxyService { inner, handle: self.handle.clone() }
+        EngineSszProxyService { inner, handle: self.handle.clone(), enabled: self.enabled }
     }
 }
 
@@ -193,6 +200,7 @@ impl<S, Api> Layer<S> for EngineSszProxyLayer<Api> {
 pub struct EngineSszProxyService<S, Api = ()> {
     inner: S,
     handle: EngineSszProxyHandle<Api>,
+    enabled: bool,
 }
 
 impl<S, Api> Service<HttpRequest> for EngineSszProxyService<S, Api>
@@ -214,6 +222,11 @@ where
             return Either::Left(self.inner.call(request))
         }
 
+        if !self.enabled {
+            return Either::Right(Box::pin(async {
+                Ok(problem_response(STATUS_NOT_FOUND, "method-not-found", None))
+            }))
+        }
         let handle = self.handle.clone();
         Either::Right(Box::pin(async move { Ok(handle_engine_ssz_request(handle, request).await) }))
     }
@@ -1260,6 +1273,30 @@ mod tests {
         PayloadAttributesShanghai,
     };
     use ssz::Encode;
+
+    #[tokio::test]
+    async fn disabled_ssz_routes_fall_back_to_json_rpc() {
+        use tower::ServiceExt;
+        #[derive(Clone)]
+        struct Api;
+        impl EngineSszApi for Api {}
+        let (layer, _) = EngineSszProxyLayer::with_engine_api(Api);
+        let inner = tower::service_fn(|_: HttpRequest| async {
+            Ok::<_, BoxError>(HttpResponse::new(HttpBody::from("json-rpc")))
+        });
+        let service = layer.with_enabled(false).layer(inner);
+        for route in
+            ["/engine/v1/capabilities", "/engine/v1/paris/payloads", "/engine/v1/payloads/witness"]
+        {
+            let request = HttpRequest::builder().uri(route).body(HttpBody::empty()).unwrap();
+            let response = service.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), STATUS_NOT_FOUND);
+        }
+        let request = HttpRequest::builder().uri("/").body(HttpBody::empty()).unwrap();
+        let response = service.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), STATUS_OK);
+        assert_eq!(response.into_body().collect().await.unwrap().to_bytes(), "json-rpc");
+    }
 
     #[tokio::test]
     async fn witness_capabilities_follow_both_wiring_orders() {

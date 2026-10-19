@@ -1,8 +1,8 @@
 //! Estimate gas needed implementation
 
-use super::{Call, LoadPendingBlock};
+use super::{overrides::apply_state_overrides, Call, LoadPendingBlock};
 use crate::{AsEthApiError, FromEthApiError, IntoEthApiError};
-use alloy_evm::overrides::{apply_block_overrides, apply_state_overrides};
+use alloy_evm::overrides::apply_block_overrides;
 use alloy_network::TransactionBuilder;
 use alloy_primitives::{TxKind, U256};
 use alloy_rpc_types_eth::{state::EvmOverrides, BlockId};
@@ -96,12 +96,7 @@ pub trait EstimateCall: Call {
 
         // the gas limit of the corresponding block
         let block_gas_limit = evm_env.block_env.gas_limit();
-        // If EIP-8037 is enabled, the transaction gas limit cap is not applicable
-        let mut max_gas_limit = if evm_env.cfg_env.is_amsterdam_eip8037_enabled() {
-            block_gas_limit
-        } else {
-            evm_env.cfg_env.tx_gas_limit_cap().min(block_gas_limit)
-        };
+        let mut max_gas_limit = max_transaction_gas_limit(&evm_env.cfg_env, block_gas_limit);
 
         // Also bound diagnostic retries by the RPC gas cap. Zero means unlimited.
         let gas_cap = self.call_gas_limit();
@@ -391,4 +386,37 @@ pub fn update_estimated_gas_range<Halt>(
     };
 
     Ok(())
+}
+
+/// Ethereum's EIP-8037 cap excludes state gas. Fluent retains a total transaction cap.
+fn max_transaction_gas_limit(cfg: &impl Cfg, block_gas_limit: u64) -> u64 {
+    if cfg.is_amsterdam_eip8037_enabled() && cfg.is_legacy_bytecode_enabled() {
+        block_gas_limit
+    } else {
+        cfg.tx_gas_limit_cap().min(block_gas_limit)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use revm::{context::CfgEnv, primitives::hardfork::SpecId};
+
+    #[test]
+    fn fluent_total_transaction_gas_limit_is_retained_with_eip8037() {
+        let mut cfg = CfgEnv::new_with_spec(SpecId::AMSTERDAM);
+        assert!(cfg.is_amsterdam_eip8037_enabled());
+        cfg.tx_gas_limit_cap = Some(100_000_000);
+        cfg.legacy_bytecode_enabled = false;
+        assert_eq!(max_transaction_gas_limit(&cfg, 200_000_000), 100_000_000);
+        assert_eq!(max_transaction_gas_limit(&cfg, 50_000_000), 50_000_000);
+
+        // Ethereum can use a reservoir above its regular-gas cap.
+        cfg.legacy_bytecode_enabled = true;
+        assert_eq!(max_transaction_gas_limit(&cfg, 200_000_000), 200_000_000);
+        assert_eq!(max_transaction_gas_limit(&cfg, 50_000_000), 50_000_000);
+
+        cfg.enable_amsterdam_eip8037 = false;
+        assert_eq!(max_transaction_gas_limit(&cfg, 200_000_000), 100_000_000);
+    }
 }

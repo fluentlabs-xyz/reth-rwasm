@@ -1,8 +1,7 @@
 //! Transaction pool arguments
 
 use crate::cli::config::RethTransactionPoolConfig;
-use alloy_eips::eip1559::{ETHEREUM_BLOCK_GAS_LIMIT_30M, MIN_PROTOCOL_BASE_FEE};
-use alloy_primitives::Address;
+use alloy_primitives::{map::AddressSet, Address};
 use clap::{
     builder::{RangedU64ValueParser, Resettable},
     Args,
@@ -22,6 +21,70 @@ use std::{path::PathBuf, sync::OnceLock, time::Duration};
 
 /// Global static transaction pool defaults
 static TXPOOL_DEFAULTS: OnceLock<DefaultTxPoolValues> = OnceLock::new();
+
+const DEFAULT_MINIMAL_PROTOCOL_BASEFEE: u64 = 1_000_000;
+const DEFAULT_MINIMUM_PRIORITY_FEE: u128 = 0;
+const DEFAULT_ENFORCED_GAS_LIMIT: u64 = 50_000_000;
+
+fn parse_txpool_disallow_file(path: &str) -> Result<AddressSet, String> {
+    let entries = match reth_cli_util::parsers::read_json_from_file::<Vec<String>>(path) {
+        Ok(values) => values,
+        Err(_) => {
+            let raw = std::fs::read_to_string(path).map_err(|error| {
+                format!("failed to read txpool disallow file `{path}`: {error}")
+            })?;
+            raw.split(|ch: char| ch.is_whitespace() || ch == ',')
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        }
+    };
+
+    let mut disallow = AddressSet::default();
+    let mut invalid = Vec::new();
+
+    for value in entries {
+        let token =
+            value.trim().trim_matches(|ch| matches!(ch, '"' | '\'' | '[' | ']' | '{' | '}' | ';'));
+        if token.is_empty() {
+            continue;
+        }
+
+        if !token.starts_with("0x") && !token.starts_with("0X") {
+            continue;
+        }
+
+        let normalized = if let Some(value) = token.strip_prefix("0X") {
+            format!("0x{value}")
+        } else {
+            token.to_string()
+        };
+
+        match normalized.parse::<Address>() {
+            Ok(address) => {
+                disallow.insert(address);
+            }
+            Err(_) => invalid.push(normalized),
+        }
+    }
+
+    if !invalid.is_empty() {
+        let shown = invalid.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+        let suffix = if invalid.len() > 5 {
+            format!(" (and {} more)", invalid.len() - 5)
+        } else {
+            String::new()
+        };
+        return Err(format!(
+            "invalid EVM addresses in txpool disallow file `{path}`: {shown}{suffix}"
+        ));
+    }
+
+    if disallow.is_empty() {
+        return Err(format!("txpool disallow file `{path}` contains no EVM addresses"));
+    }
+
+    Ok(disallow)
+}
 
 /// Default values for transaction pool that can be customized
 ///
@@ -49,6 +112,7 @@ pub struct DefaultTxPoolValues {
     max_cached_entries: u32,
     no_locals: bool,
     locals: Vec<Address>,
+    disallow: Option<AddressSet>,
     no_local_transactions_propagation: bool,
     additional_validation_tasks: usize,
     pending_tx_listener_buffer_size: usize,
@@ -197,6 +261,12 @@ impl DefaultTxPoolValues {
         self
     }
 
+    /// Set the default transaction disallow set.
+    pub fn with_disallow(mut self, v: Option<AddressSet>) -> Self {
+        self.disallow = v;
+        self
+    }
+
     /// Set whether to disable local transaction propagation by default
     pub const fn with_no_local_transactions_propagation(mut self, v: bool) -> Self {
         self.no_local_transactions_propagation = v;
@@ -267,15 +337,16 @@ impl Default for DefaultTxPoolValues {
             disable_blobs_support: false,
             max_account_slots: TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER,
             price_bump: DEFAULT_PRICE_BUMP,
-            minimal_protocol_basefee: MIN_PROTOCOL_BASE_FEE,
-            minimum_priority_fee: None,
-            enforced_gas_limit: ETHEREUM_BLOCK_GAS_LIMIT_30M,
+            minimal_protocol_basefee: DEFAULT_MINIMAL_PROTOCOL_BASEFEE,
+            minimum_priority_fee: Some(DEFAULT_MINIMUM_PRIORITY_FEE),
+            enforced_gas_limit: DEFAULT_ENFORCED_GAS_LIMIT,
             max_tx_gas_limit: None,
             blob_transaction_price_bump: REPLACE_BLOB_PRICE_BUMP,
             max_tx_input_bytes: DEFAULT_MAX_TX_INPUT_BYTES,
             max_cached_entries: DEFAULT_MAX_CACHED_BLOBS,
             no_locals: false,
             locals: Vec::new(),
+            disallow: None,
             no_local_transactions_propagation: false,
             additional_validation_tasks: DEFAULT_TXPOOL_ADDITIONAL_VALIDATION_TASKS,
             pending_tx_listener_buffer_size: PENDING_TX_LISTENER_BUFFER_SIZE,
@@ -373,6 +444,22 @@ pub struct TxPoolArgs {
     /// Flag to allow certain addresses as local.
     #[arg(long = "txpool.locals", default_values = DefaultTxPoolValues::get_global().locals.iter().map(ToString::to_string))]
     pub locals: Vec<Address>,
+
+    /// Path to txpool disallow list.
+    ///
+    /// Supported file formats:
+    /// - JSON array of address strings: `["0x...", "0x..."]`
+    /// - Plain text with mixed tokens (newline/space/comma separated); non-EVM entries are ignored
+    ///
+    /// Only valid EVM addresses are loaded and denied by policy.
+    #[arg(
+        long = "txpool.disallow",
+        value_name = "PATH",
+        value_parser = parse_txpool_disallow_file,
+        default_value = Resettable::from(DefaultTxPoolValues::get_global().disallow.as_ref().map(|v| format!("{:?}", v).into()))
+    )]
+    pub disallow: Option<AddressSet>,
+
     /// Flag to toggle local transaction propagation.
     #[arg(long = "txpool.no-local-transactions-propagation", default_value_t = DefaultTxPoolValues::get_global().no_local_transactions_propagation)]
     pub no_local_transactions_propagation: bool,
@@ -418,16 +505,16 @@ pub struct TxPoolArgs {
 
 impl TxPoolArgs {
     /// Sets the minimal protocol base fee to 0, effectively disabling checks that enforce that a
-    /// transaction's fee must be higher than the [`MIN_PROTOCOL_BASE_FEE`] which is the lowest
-    /// value the ethereum EIP-1559 base fee can reach.
+    /// transaction's fee must be higher than the [`DEFAULT_MINIMAL_PROTOCOL_BASEFEE`] which is the
+    /// lowest value the ethereum EIP-1559 base fee can reach.
     pub const fn with_disabled_protocol_base_fee(self) -> Self {
         self.with_protocol_base_fee(0)
     }
 
     /// Configures the minimal protocol base fee that should be enforced.
     ///
-    /// Ethereum's EIP-1559 base fee can't drop below [`MIN_PROTOCOL_BASE_FEE`] hence this is
-    /// enforced by default in the pool.
+    /// Ethereum's EIP-1559 base fee can't drop below [`DEFAULT_MINIMAL_PROTOCOL_BASEFEE`] hence
+    /// this is enforced by default in the pool.
     pub const fn with_protocol_base_fee(mut self, protocol_base_fee: u64) -> Self {
         self.minimal_protocol_basefee = protocol_base_fee;
         self
@@ -458,6 +545,7 @@ impl Default for TxPoolArgs {
             max_cached_entries,
             no_locals,
             locals,
+            disallow,
             no_local_transactions_propagation,
             additional_validation_tasks,
             pending_tx_listener_buffer_size,
@@ -490,6 +578,7 @@ impl Default for TxPoolArgs {
             max_cached_entries,
             no_locals,
             locals,
+            disallow,
             no_local_transactions_propagation,
             additional_validation_tasks,
             pending_tx_listener_buffer_size,
@@ -571,6 +660,9 @@ mod tests {
         let default_args = TxPoolArgs::default();
         let args = CommandParser::<TxPoolArgs>::parse_from(["reth"]).args;
         assert_eq!(args, default_args);
+        assert_eq!(args.minimal_protocol_basefee, DEFAULT_MINIMAL_PROTOCOL_BASEFEE);
+        assert_eq!(args.minimum_priority_fee, Some(DEFAULT_MINIMUM_PRIORITY_FEE));
+        assert_eq!(args.enforced_gas_limit, DEFAULT_ENFORCED_GAS_LIMIT);
     }
 
     #[test]
@@ -631,6 +723,7 @@ mod tests {
                 address!("0x0000000000000000000000000000000000000001"),
                 address!("0x0000000000000000000000000000000000000002"),
             ],
+            disallow: None,
             no_local_transactions_propagation: true,
             additional_validation_tasks: 4,
             pending_tx_listener_buffer_size: 512,
@@ -704,5 +797,36 @@ mod tests {
         .args;
 
         assert_eq!(parsed_args, args);
+    }
+
+    #[test]
+    fn parse_txpool_disallow_file_accepts_mixed_plain_text() {
+        let path =
+            std::env::temp_dir().join(format!("reth-txpool-disallow-{}.txt", std::process::id()));
+        std::fs::write(
+            &path,
+            "TA3941uFAvmVibSkQ6fMJXxmaSNovX86mz\n0x00000000000000000000000000000000000000aa\n0x00000000000000000000000000000000000000bb",
+        )
+        .unwrap();
+
+        let parsed = parse_txpool_disallow_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed.contains(&address!("0x00000000000000000000000000000000000000aa")));
+        assert!(parsed.contains(&address!("0x00000000000000000000000000000000000000bb")));
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn parse_txpool_disallow_file_rejects_invalid_evm_addresses() {
+        let path = std::env::temp_dir()
+            .join(format!("reth-txpool-disallow-invalid-{}.txt", std::process::id()));
+        std::fs::write(&path, "0x1234\n0x00000000000000000000000000000000000000aa").unwrap();
+
+        let result = parse_txpool_disallow_file(path.to_str().unwrap());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid EVM addresses"));
+
+        std::fs::remove_file(path).unwrap();
     }
 }

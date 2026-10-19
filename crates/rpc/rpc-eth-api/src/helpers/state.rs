@@ -10,6 +10,7 @@ use alloy_eips::BlockId;
 use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy_rpc_types_eth::{Account, AccountInfo, EIP1186AccountProofResponse};
 use alloy_serde::JsonStorageKey;
+use fluentbase_evm::EthereumMetadata;
 use futures::Future;
 use reth_errors::RethError;
 use reth_evm::{ConfigureEvm, EvmEnvFor};
@@ -49,7 +50,7 @@ pub trait EthState: LoadState + SpawnBlocking {
             .map_err(Self::Error::from_eth_err)?
             .ok_or(EthApiError::HeaderNotFound(block_id))?;
         if chain_info.best_number.saturating_sub(block_number) > self.max_proof_window() {
-            return Err(EthApiError::ExceedsMaxProofWindow.into())
+            return Err(EthApiError::ExceedsMaxProofWindow.into());
         }
         Ok(())
     }
@@ -73,6 +74,15 @@ pub trait EthState: LoadState + SpawnBlocking {
         block_id: Option<BlockId>,
     ) -> impl Future<Output = Result<Bytes, Self::Error>> + Send {
         LoadState::get_code(self, address, block_id)
+    }
+
+    /// Returns code of a given account, at a given blocknumber.
+    fn get_raw_code(
+        &self,
+        address: Address,
+        block_id: Option<BlockId>,
+    ) -> impl Future<Output = Result<Bytes, Self::Error>> + Send {
+        LoadState::get_raw_code(self, address, block_id)
     }
 
     /// Returns balance of given account, at given blocknumber.
@@ -244,6 +254,37 @@ pub trait EthState: LoadState + SpawnBlocking {
         })
     }
 
+    /// Returns the account with its stored runtime code hash.
+    fn get_raw_account(
+        &self,
+        address: Address,
+        block_id: BlockId,
+    ) -> impl Future<Output = Result<Option<Account>, Self::Error>> + Send
+    where
+        Self: EthApiSpec,
+    {
+        async move {
+            self.ensure_within_proof_window(block_id)?;
+            self.spawn_blocking_io_with_state(block_id, move |_, state| {
+                let Some(account) =
+                    state.basic_account(&address).map_err(Self::Error::from_eth_err)?
+                else {
+                    return Ok(None)
+                };
+                let storage_root = state
+                    .storage_root(address, Default::default())
+                    .map_err(Self::Error::from_eth_err)?;
+                Ok(Some(Account {
+                    balance: account.balance,
+                    nonce: account.nonce,
+                    code_hash: account.bytecode_hash.unwrap_or(KECCAK_EMPTY),
+                    storage_root,
+                }))
+            })
+            .await
+        }
+    }
+
     /// Returns the account at the given address for the provided block identifier.
     fn get_account(
         &self,
@@ -262,7 +303,27 @@ pub trait EthState: LoadState + SpawnBlocking {
 
                 let balance = account.balance;
                 let nonce = account.nonce;
-                let code_hash = account.bytecode_hash.unwrap_or(KECCAK_EMPTY);
+                let mut code_hash = account.bytecode_hash.unwrap_or(KECCAK_EMPTY);
+
+                if code_hash != KECCAK_EMPTY {
+                    let bytecode = state
+                        .account_code(&address)
+                        .map_err(Self::Error::from_eth_err)?
+                        .unwrap_or_default();
+                    match &bytecode.0 {
+                        // Only this very runtime + owner gets «stripped» code
+                        reth_revm::bytecode::Bytecode::OwnableAccount(acc)
+                            if acc.owner_address == fluentbase_types::PRECOMPILE_EVM_RUNTIME =>
+                        {
+                            code_hash = EthereumMetadata::read_from_bytes(&acc.metadata)
+                                .as_ref()
+                                .map(EthereumMetadata::code_hash)
+                                .unwrap_or(KECCAK_EMPTY);
+                        }
+                        // Everything else – return as-is
+                        _ => {}
+                    }
+                }
 
                 // Provide a default `HashedStorage` value in order to
                 // get the storage root hash of the current state.
@@ -277,7 +338,7 @@ pub trait EthState: LoadState + SpawnBlocking {
     }
 
     /// Retrieves the account's balance, nonce, and code for a given address.
-    fn get_account_info(
+    fn get_raw_account_info(
         &self,
         address: Address,
         block_id: BlockId,
@@ -298,6 +359,46 @@ pub trait EthState: LoadState + SpawnBlocking {
                     .map_err(Self::Error::from_eth_err)?
                     .unwrap_or_default()
                     .original_bytes()
+            };
+
+            Ok(AccountInfo { balance, nonce, code })
+        })
+    }
+
+    /// Retrieves the account's balance, nonce, and code for a given address.
+    fn get_account_info(
+        &self,
+        address: Address,
+        block_id: BlockId,
+    ) -> impl Future<Output = Result<AccountInfo, Self::Error>> + Send {
+        self.spawn_blocking_io_with_state(block_id, move |_, state| {
+            let account = state
+                .basic_account(&address)
+                .map_err(Self::Error::from_eth_err)?
+                .unwrap_or_default();
+
+            let balance = account.balance;
+            let nonce = account.nonce;
+            let code = if account.get_bytecode_hash() == KECCAK_EMPTY {
+                Default::default()
+            } else {
+                let bytecode = state
+                    .account_code(&address)
+                    .map_err(Self::Error::from_eth_err)?
+                    .unwrap_or_default();
+                match &bytecode.0 {
+                    // Only this very runtime + owner gets «stripped» code
+                    reth_revm::bytecode::Bytecode::OwnableAccount(acc)
+                        if acc.owner_address == fluentbase_types::PRECOMPILE_EVM_RUNTIME =>
+                    {
+                        EthereumMetadata::read_from_bytes(&acc.metadata)
+                            .as_ref()
+                            .map(EthereumMetadata::code_copy)
+                            .unwrap_or_default()
+                    }
+                    // Everything else – return as-is
+                    _ => bytecode.original_bytes(),
+                }
             };
 
             Ok(AccountInfo { balance, nonce, code })
@@ -340,7 +441,7 @@ pub trait LoadState:
             if at.is_pending() &&
                 let Ok(Some(state)) = self.local_pending_state().await
             {
-                return Ok(state)
+                return Ok(state);
             }
 
             self.provider().state_by_block_id(at).map_err(Self::Error::from_eth_err)
@@ -589,7 +690,36 @@ pub trait LoadState:
     }
 
     /// Returns code of given account, at the given identifier.
+    /// Returns the account’s original code (runtime compatible).
     fn get_code(
+        &self,
+        address: Address,
+        block_id: Option<BlockId>,
+    ) -> impl Future<Output = Result<Bytes, Self::Error>> + Send
+    where
+        Self: SpawnBlocking,
+    {
+        self.spawn_blocking_io_with_state(block_id.unwrap_or_default(), move |_, state| {
+            let bytecode = state
+                .account_code(&address)
+                .map_err(Self::Error::from_eth_err)?
+                .unwrap_or_default();
+            match &bytecode.0 {
+                reth_revm::bytecode::Bytecode::OwnableAccount(acc)
+                    if acc.owner_address == fluentbase_types::PRECOMPILE_EVM_RUNTIME =>
+                {
+                    Ok(fluentbase_evm::EthereumMetadata::read_from_bytes(&acc.metadata)
+                        .as_ref()
+                        .map(fluentbase_evm::EthereumMetadata::code_copy)
+                        .unwrap_or_default())
+                }
+                _ => Ok(bytecode.original_bytes()),
+            }
+        })
+    }
+
+    /// Returns the stored runtime bytecode without applying Ethereum metadata projection.
+    fn get_raw_code(
         &self,
         address: Address,
         block_id: Option<BlockId>,

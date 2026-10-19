@@ -323,7 +323,7 @@ reth-cli = { path = "crates/cli/cli" }
 reth-cli-commands = { path = "crates/cli/commands" }
 reth-cli-runner = { path = "crates/cli/runner" }
 reth-cli-util = { path = "crates/cli/util" }
-reth-codecs = { version = "0.8.1", default-features = false }
+reth-codecs = { version = "=0.8.1", default-features = false }
 reth-codecs-derive = "0.8.1"
 reth-config = { path = "crates/config", default-features = false }
 reth-consensus = { path = "crates/consensus/consensus", default-features = false }
@@ -390,7 +390,7 @@ reth-payload-builder = { path = "crates/payload/builder" }
 reth-payload-builder-primitives = { path = "crates/payload/builder-primitives" }
 reth-payload-primitives = { path = "crates/payload/primitives" }
 reth-payload-validator = { path = "crates/payload/validator" }
-reth-primitives-traits = { version = "0.8.1", default-features = false }
+reth-primitives-traits = { version = "=0.8.1", default-features = false }
 reth-provider = { path = "crates/storage/provider" }
 reth-prune = { path = "crates/prune/prune" }
 reth-prune-types = { path = "crates/prune/types", default-features = false }
@@ -427,14 +427,18 @@ reth-trie-sparse = { path = "crates/trie/sparse", default-features = false }
 reth-zstd-compressors = { version = "0.8.1", default-features = false }
 
 # revm
-revm = { version = "43.0.3", default-features = false }
+revm = { version = "=43.0.3", default-features = false }
 revmc = { git = "https://github.com/paradigmxyz/revmc", branch = "main", default-features = false, features = ["llvm-prefer-static"] }
 revm-inspectors = "0.44.0"
+
+# fluentbase
+fluentbase-types = { git = "https://github.com/fluentlabs-xyz/fluentbase", branch = "devel", default-features = false }
+fluentbase-evm = { git = "https://github.com/fluentlabs-xyz/fluentbase", branch = "devel", default-features = false, features = ["std"] }
 
 # eth
 alloy-dyn-abi = "1.6.1"
 alloy-primitives = { version = "1.6.1", default-features = false, features = ["map-foldhash"] }
-alloy-sol-types = { version = "1.6.1", default-features = false }
+alloy-sol-types = { version = "1.6.1", default-features = false, features = ["json"] }
 
 alloy-chains = { version = "0.2.33", default-features = false }
 alloy-eip2124 = { version = "0.2.0", default-features = false }
@@ -661,3 +665,17 @@ vergen-git2 = "10.0.1"
 
 # networking
 ipnet = "2.11"
+
+[patch.crates-io]
+reth-codecs = { git = "https://github.com/fluentlabs-xyz/reth-core-rwasm", branch = "v0.8.1-patched" }
+reth-primitives-traits = { git = "https://github.com/fluentlabs-xyz/reth-core-rwasm", branch = "v0.8.1-patched" }
+revm = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v120-patched" }
+revm-bytecode = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v120-patched" }
+revm-database = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v120-patched" }
+revm-state = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v120-patched" }
+revm-primitives = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v120-patched" }
+revm-interpreter = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v120-patched" }
+revm-inspector = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v120-patched" }
+revm-context = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v120-patched" }
+revm-context-interface = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v120-patched" }
+revm-database-interface = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v120-patched" }

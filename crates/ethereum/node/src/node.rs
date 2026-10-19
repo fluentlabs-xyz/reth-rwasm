@@ -10,7 +10,7 @@ use alloy_network::Ethereum;
 use alloy_rpc_types_engine::ExecutionData;
 use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks, Hardforks};
 use reth_engine_local::LocalPayloadAttributesBuilder;
-use reth_engine_primitives::EngineTypes;
+use reth_engine_primitives::{EngineTypes, PayloadValidator};
 use reth_ethereum_consensus::EthBeaconConsensus;
 use reth_ethereum_engine_primitives::{EthBuiltPayload, EthPayloadAttributes};
 use reth_ethereum_primitives::{EthPrimitives, TransactionSigned};
@@ -180,6 +180,7 @@ pub struct EthereumAddOns<
     AuthHttpMiddleware = Identity,
 > {
     inner: RpcAddOns<N, EthB, PVB, EB, EVB, RpcMiddleware, AuthHttpMiddleware>,
+    engine_ssz_enabled: bool,
 }
 
 impl<N, EthB, PVB, EB, EVB, RpcMiddleware, AuthHttpMiddleware>
@@ -192,7 +193,7 @@ where
     pub const fn new(
         inner: RpcAddOns<N, EthB, PVB, EB, EVB, RpcMiddleware, AuthHttpMiddleware>,
     ) -> Self {
-        Self { inner }
+        Self { inner, engine_ssz_enabled: true }
     }
 }
 
@@ -226,6 +227,13 @@ where
     N: FullNodeComponents,
     EthB: EthApiBuilder<N>,
 {
+    /// Enables the experimental SSZ Engine transport. Chains whose rules differ from
+    /// Ethereum's SSZ schema can disable it and retain the JSON-RPC Engine API.
+    pub const fn with_engine_ssz_enabled(mut self, enabled: bool) -> Self {
+        self.engine_ssz_enabled = enabled;
+        self
+    }
+
     /// Replace the engine API builder.
     pub fn with_engine_api<T>(
         self,
@@ -234,8 +242,9 @@ where
     where
         T: Send,
     {
-        let Self { inner } = self;
+        let Self { inner, engine_ssz_enabled } = self;
         EthereumAddOns::new(inner.with_engine_api(engine_api_builder))
+            .with_engine_ssz_enabled(engine_ssz_enabled)
     }
 
     /// Replace the payload validator builder.
@@ -243,8 +252,9 @@ where
         self,
         payload_validator_builder: T,
     ) -> EthereumAddOns<N, EthB, T, EB, EVB, RpcMiddleware, AuthHttpMiddleware> {
-        let Self { inner } = self;
+        let Self { inner, engine_ssz_enabled } = self;
         EthereumAddOns::new(inner.with_payload_validator(payload_validator_builder))
+            .with_engine_ssz_enabled(engine_ssz_enabled)
     }
 
     /// Sets rpc middleware
@@ -255,8 +265,9 @@ where
     where
         T: Send,
     {
-        let Self { inner } = self;
+        let Self { inner, engine_ssz_enabled } = self;
         EthereumAddOns::new(inner.with_rpc_middleware(rpc_middleware))
+            .with_engine_ssz_enabled(engine_ssz_enabled)
     }
 
     /// Configures the HTTP transport middleware for the auth / Engine API server.
@@ -267,8 +278,9 @@ where
     where
         T: Send,
     {
-        let Self { inner } = self;
+        let Self { inner, engine_ssz_enabled } = self;
         EthereumAddOns::new(inner.with_auth_http_middleware(auth_http_middleware))
+            .with_engine_ssz_enabled(engine_ssz_enabled)
     }
 
     /// Stacks an additional HTTP transport middleware layer for the auth / Engine API server.
@@ -276,8 +288,9 @@ where
         self,
         layer: T,
     ) -> EthereumAddOns<N, EthB, PVB, EB, EVB, RpcMiddleware, Stack<AuthHttpMiddleware, T>> {
-        let Self { inner } = self;
+        let Self { inner, engine_ssz_enabled } = self;
         EthereumAddOns::new(inner.layer_auth_http_middleware(layer))
+            .with_engine_ssz_enabled(engine_ssz_enabled)
     }
 
     /// Conditionally stacks an HTTP transport middleware layer for the auth / Engine API server.
@@ -294,16 +307,17 @@ where
         RpcMiddleware,
         Stack<AuthHttpMiddleware, Either<T, Identity>>,
     > {
-        let Self { inner } = self;
+        let Self { inner, engine_ssz_enabled } = self;
         EthereumAddOns::new(inner.option_layer_auth_http_middleware(layer))
+            .with_engine_ssz_enabled(engine_ssz_enabled)
     }
 
     /// Sets the tokio runtime for the RPC servers.
     ///
     /// Caution: This runtime must not be created from within asynchronous context.
     pub fn with_tokio_runtime(self, tokio_runtime: Option<tokio::runtime::Handle>) -> Self {
-        let Self { inner } = self;
-        Self { inner: inner.with_tokio_runtime(tokio_runtime) }
+        let Self { inner, engine_ssz_enabled } = self;
+        Self { inner: inner.with_tokio_runtime(tokio_runtime), engine_ssz_enabled }
     }
 }
 
@@ -319,7 +333,9 @@ where
         Evm: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes>,
     >,
     EthB: EthApiBuilder<N>,
-    PVB: Send,
+    PVB: PayloadValidatorBuilder<N>,
+    PVB::Validator:
+        PayloadValidator<<N::Types as NodeTypes>::Payload, Block = reth_ethereum_primitives::Block>,
     EB: EngineApiBuilder<N>,
     EB::EngineApi: EngineSszApi,
     EVB: EngineValidatorBuilder<N>,
@@ -335,13 +351,14 @@ where
         self,
         ctx: reth_node_api::AddOnsContext<'_, N>,
     ) -> eyre::Result<Self::Handle> {
+        let payload_validator = self.inner.payload_validator_builder().clone().build(&ctx).await?;
         let validation_api = ValidationApi::<_, _, <N::Types as NodeTypes>::Payload>::new(
             ctx.node.provider().clone(),
             Arc::new(ctx.node.consensus().clone()),
             ctx.node.evm_config().clone(),
             ctx.config.rpc.flashbots_config(),
             ctx.node.task_executor().clone(),
-            Arc::new(EthereumEngineValidator::new(ctx.config.chain.clone())),
+            Arc::new(payload_validator),
             ctx.sender_recovery_cache.clone(),
         );
 
@@ -354,6 +371,7 @@ where
         let testing_engine_handle = ctx.beacon_engine_handle.clone();
 
         let (ssz_proxy_layer, ssz_proxy_handle) = EngineSszProxyLayer::new();
+        let ssz_proxy_layer = ssz_proxy_layer.with_enabled(self.engine_ssz_enabled);
         ssz_proxy_handle.set_witness_handler_sync(Arc::new(EngineSszWitnessGenerator::new(
             ctx.node.provider().clone(),
             ctx.node.evm_config().clone(),
@@ -414,6 +432,8 @@ where
     >,
     EthB: EthApiBuilder<N>,
     PVB: PayloadValidatorBuilder<N>,
+    PVB::Validator:
+        PayloadValidator<<N::Types as NodeTypes>::Payload, Block = reth_ethereum_primitives::Block>,
     EB: EngineApiBuilder<N>,
     EB::EngineApi: EngineSszApi,
     EVB: EngineValidatorBuilder<N>,
@@ -727,12 +747,18 @@ where
         let blob_store =
             reth_node_builder::components::create_blob_store_with_cache(ctx, blob_cache_size)?;
 
+        let txpool_disallow = ctx.config().txpool.disallow.clone().unwrap_or_default();
+        if !txpool_disallow.is_empty() {
+            info!(target: "reth::cli", count = txpool_disallow.len(), "Loaded txpool disallow policy addresses");
+        }
+
         let validator =
             TransactionValidationTaskExecutor::eth_builder(ctx.provider().clone(), evm_config)
                 .set_eip4844(!blobs_disabled)
                 .kzg_settings(ctx.kzg_settings()?)
                 .with_max_tx_input_bytes(ctx.config().txpool.max_tx_input_bytes)
                 .with_local_transactions_config(pool_config.local_transactions_config.clone())
+                .with_disallow(txpool_disallow)
                 .set_tx_fee_cap(ctx.config().rpc.rpc_tx_fee_cap)
                 .with_max_tx_gas_limit(ctx.config().txpool.max_tx_gas_limit)
                 .with_minimum_priority_fee(ctx.config().txpool.minimum_priority_fee)

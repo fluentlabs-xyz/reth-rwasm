@@ -1231,6 +1231,9 @@ mod tests {
             // Both capped regular limits fit. The full limit of the second transaction
             // must still fit the state budget consumed by the first account creation.
             evm_env.cfg_env.tx_gas_limit_cap = Some(400_000);
+            // This fixture exercises Ethereum's regular-gas cap. Fluent caps the total
+            // transaction gas instead, including the state-gas reservoir.
+            evm_env.cfg_env.legacy_bytecode_enabled = true;
             let ctx = evm_config.context_for_block(&block).unwrap();
             let mut state = State::builder().with_database(pre_block_db.clone()).build();
             let evm = evm_config.evm_with_env(&mut state, evm_env.clone());

@@ -554,10 +554,7 @@ mod tests {
     use alloy_network::TransactionBuilder;
     use alloy_primitives::{Address, Bytes, Signature, B256, U256, U64};
     use alloy_rpc_types::FeeHistory;
-    use alloy_rpc_types_eth::{
-        state::{AccountOverride, EvmOverrides, StateOverride},
-        Bundle, TransactionRequest,
-    };
+    use alloy_rpc_types_eth::{state::EvmOverrides, Bundle, TransactionRequest};
     use jsonrpsee_types::error::INVALID_PARAMS_CODE;
     use rand::Rng;
     use reth_chain_state::CanonStateSubscriptions;
@@ -1122,9 +1119,7 @@ mod tests {
         ]);
         let sender = Address::repeat_byte(0x11);
         let contract = Address::repeat_byte(0xaa);
-        let mut state_override = StateOverride::default();
-        state_override.insert(contract, AccountOverride { code: Some(code), ..Default::default() });
-        let overrides = EvmOverrides::state(Some(state_override));
+        let overrides = EvmOverrides::default();
         let at = BlockId::Number(BlockNumberOrTag::Latest);
 
         for chain_spec in [
@@ -1134,6 +1129,12 @@ mod tests {
         ] {
             let provider = MockEthProvider::default().with_chain_spec(chain_spec);
             provider.add_account(sender, ExtendedAccount::new(0, U256::MAX));
+            // The native Ethereum fixture executes legacy code. Fluent RPC code overrides
+            // use runtime-owned metadata, so install this contract directly in its prestate.
+            provider.add_account(
+                contract,
+                ExtendedAccount::new(1, U256::ZERO).with_bytecode(code.clone()),
+            );
             provider.add_block(
                 B256::repeat_byte(0x42),
                 Block {

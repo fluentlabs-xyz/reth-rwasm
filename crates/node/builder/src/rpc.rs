@@ -604,6 +604,11 @@ where
         }
     }
 
+    /// Returns the payload-validator builder shared by additional RPC APIs.
+    pub const fn payload_validator_builder(&self) -> &PVB {
+        &self.payload_validator_builder
+    }
+
     /// Maps the [`EngineApiBuilder`] builder type.
     pub fn with_engine_api<T>(
         self,

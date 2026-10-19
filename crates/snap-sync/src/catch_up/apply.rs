@@ -388,6 +388,9 @@ mod tests {
             State::builder().with_database(&mut db).with_bundle_update().with_bal_builder().build();
         {
             let mut executor = evm_config.executor_for_block(&mut state, &block).unwrap();
+            // Native Ethereum CREATE must persist legacy code for the BAL comparison.
+            // Fluent delegates code deployment to its runtime instead.
+            executor.evm_mut().ctx_mut().cfg.legacy_bytecode_enabled = true;
             executor.apply_pre_execution_changes().unwrap();
             for tx in txs {
                 executor.evm_mut().db_mut().bump_bal_index();

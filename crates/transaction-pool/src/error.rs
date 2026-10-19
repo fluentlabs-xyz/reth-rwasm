@@ -317,6 +317,9 @@ pub enum InvalidPoolTransactionError {
         /// Minimum required priority fee.
         minimum_priority_fee: u128,
     },
+    /// The transaction is rejected by the configured local address policy.
+    #[error("tx not allowed")]
+    NotAllowed,
 }
 
 // === impl InvalidPoolTransactionError ===
@@ -436,6 +439,7 @@ impl InvalidPoolTransactionError {
                 Eip7702PoolTransactionError::AuthorityReserved => false,
             },
             Self::PriorityFeeBelowMinimum { .. } => false,
+            Self::NotAllowed => false,
         }
     }
 

@@ -101,7 +101,8 @@ use eyre::Result;
 use manifest::{ComponentSelection, SnapshotComponentType, SnapshotManifest};
 use planning::{collect_planned_archives, summarize_download_startup, PlannedDownloads};
 use progress::{DownloadProgress, DownloadRequestLimiter};
-use reth_chainspec::{EthChainSpec, EthereumHardfork, EthereumHardforks, MAINNET};
+use reqwest::Client;
+use reth_chainspec::{EthChainSpec, EthereumHardfork, EthereumHardforks};
 use reth_cli::chainspec::ChainSpecParser;
 use reth_cli_util::cancellation::CancellationToken;
 use reth_db::{init_db, Database};
@@ -110,8 +111,8 @@ use reth_fs_util as fs;
 use reth_node_core::args::DefaultPruningValues;
 use reth_prune_types::{PruneMode, PruneModes};
 use source::{
-    discover_manifest_url, fetch_manifest_from_source, fetch_snapshot_api_entries,
-    print_snapshot_listing, resolve_manifest_base_url,
+    fetch_manifest_from_source, fetch_snapshot_api_entries, print_snapshot_listing,
+    resolve_manifest_base_url,
 };
 use std::{
     borrow::Cow,
@@ -248,6 +249,13 @@ impl DownloadDefaults {
 
     fn snapshot_source_url(&self) -> &str {
         snapshot_source_url_from_api(&self.snapshot_api_url)
+    }
+
+    fn base_url(&self, chain_id: u64) -> String {
+        self.default_chain_aware_base_url
+            .as_ref()
+            .map(|url| format!("{url}/{chain_id}"))
+            .unwrap_or_else(|| self.default_base_url.to_string())
     }
 
     /// Add a snapshot source to the list
@@ -480,8 +488,15 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> DownloadCo
         let static_files_dir = (static_files_dir != data_dir.data_dir().join("static_files"))
             .then_some(static_files_dir);
 
+        let latest_url =
+            if self.url.is_none() && self.manifest_url.is_none() && self.manifest_path.is_none() {
+                Some(get_latest_snapshot_url(chain.id()).await?)
+            } else {
+                None
+            };
+
         // Legacy single-URL mode: download one archive and extract it
-        if let Some(ref url) = self.url {
+        if let Some(url) = self.url.as_ref().or(latest_url.as_ref()) {
             let cancel_token = CancellationToken::new();
             let _cancel_guard = cancel_token.drop_guard();
             let data_dir = self.env.datadir.clone().resolve_datadir(chain);
@@ -863,30 +878,37 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> DownloadCo
 
     /// Resolves the manifest source from CLI input or snapshot discovery.
     async fn resolve_manifest_source(&self, chain_id: u64) -> Result<String> {
-        if let Some(path) = &self.manifest_path {
-            return Ok(path.display().to_string());
-        }
-
-        match &self.manifest_url {
-            Some(url) => Ok(url.clone()),
-            None => {
-                let defaults = DownloadDefaults::get_global();
-                if defaults.mainnet_only_discovery() && chain_id != MAINNET.chain.id() {
-                    eyre::bail!(
-                        "Snapshots are only auto-discovered for Ethereum mainnet.\n\n\
-                         Chain {chain_id} requires an explicit source:\n\
-                         \t--manifest-url <URL>\n\
-                         \t--manifest-path <PATH>\n\
-                         \t-u <SNAPSHOT-URL>\n\n\
-                         Use --list to inspect snapshots exposed by {}.",
-                        defaults.snapshot_source_url(),
-                    );
-                }
-
-                discover_manifest_url(chain_id).await
-            }
-        }
+        Ok(self.resolve_manifest_source_with_base_url(chain_id, get_base_url))
     }
+
+    fn resolve_manifest_source_with_base_url(
+        &self,
+        chain_id: u64,
+        base_url: impl FnOnce(u64) -> String,
+    ) -> String {
+        if let Some(path) = &self.manifest_path {
+            return path.display().to_string();
+        }
+
+        self.manifest_url.clone().unwrap_or_else(|| format!("{}/manifest.json", base_url(chain_id)))
+    }
+}
+
+async fn get_latest_snapshot_url(chain_id: u64) -> Result<String> {
+    let base_url = get_base_url(chain_id);
+    let filename = Client::new()
+        .get(format!("{base_url}/latest.txt"))
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+
+    Ok(format!("{base_url}/{}", filename.trim()))
+}
+
+fn get_base_url(chain_id: u64) -> String {
+    DownloadDefaults::get_global().base_url(chain_id)
 }
 
 /// Resolves explicit `--with-*` / `--with-*-since` / `--with-*-distance` flags
@@ -1384,21 +1406,49 @@ mod tests {
     }
 
     #[test]
-    fn resolve_manifest_source_requires_explicit_source_for_non_mainnet_defaults() {
+    fn resolve_manifest_source_preserves_fluent_chain_aware_defaults() {
         let args = CommandParser::<DownloadCommand<EthereumChainSpecParser>>::parse_from([
             "reth", "--chain", "holesky",
         ])
         .args;
+        let defaults = DownloadDefaults::default()
+            .with_base_url("https://cdn.fluent.xyz/snapshots")
+            .with_chain_aware_base_url("https://cdn.fluent.xyz/snapshots")
+            .with_snapshot_api_url("https://api.fluent.xyz/snapshots");
 
-        let err = tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(args.resolve_manifest_source(HOLESKY.chain.id()))
-            .unwrap_err();
+        for chain_id in [20994, HOLESKY.chain.id()] {
+            let source = args
+                .resolve_manifest_source_with_base_url(chain_id, |chain| defaults.base_url(chain));
+            assert_eq!(
+                source,
+                format!("https://cdn.fluent.xyz/snapshots/{chain_id}/manifest.json")
+            );
+        }
+    }
 
-        let message = err.to_string();
-        assert!(message.contains("only auto-discovered for Ethereum mainnet"));
-        assert!(message.contains("--manifest-url <URL>"));
-        assert!(message.contains("-u <SNAPSHOT-URL>"));
+    #[test]
+    fn resolve_manifest_source_preserves_base_url_fallback_and_explicit_overrides() {
+        let defaults =
+            DownloadDefaults::default().with_base_url("https://cdn.fluent.xyz/snapshots");
+        let mut args = CommandParser::<DownloadCommand<EthereumChainSpecParser>>::parse_from([
+            "reth", "--chain", "holesky",
+        ])
+        .args;
+        assert_eq!(
+            args.resolve_manifest_source_with_base_url(20994, |chain| defaults.base_url(chain)),
+            "https://cdn.fluent.xyz/snapshots/manifest.json"
+        );
+        args.manifest_url = Some("https://custom.example/manifest.json".to_owned());
+        assert_eq!(
+            args.resolve_manifest_source_with_base_url(20994, |chain| defaults.base_url(chain)),
+            "https://custom.example/manifest.json"
+        );
+        args.manifest_url = None;
+        args.manifest_path = Some(PathBuf::from("./custom-manifest.json"));
+        assert_eq!(
+            args.resolve_manifest_source_with_base_url(20994, |chain| defaults.base_url(chain)),
+            "./custom-manifest.json"
+        );
     }
 
     #[test]

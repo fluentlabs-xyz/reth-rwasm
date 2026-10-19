@@ -29,6 +29,12 @@ impl<ChainSpec> EthereumEngineValidator<ChainSpec> {
         Self { inner: EthereumExecutionPayloadValidator::new(chain_spec) }
     }
 
+    /// Overrides the chain-specific extra-data limit. Ethereum defaults to 32 bytes.
+    pub fn with_max_extra_data_size(mut self, max: usize) -> Self {
+        self.inner = self.inner.with_max_extra_data_size(max);
+        self
+    }
+
     /// Returns the chain spec used by the validator.
     #[inline]
     fn chain_spec(&self) -> &ChainSpec {
@@ -81,5 +87,63 @@ where
                 attributes,
             ),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::B256;
+    use alloy_rpc_types_engine::PayloadError;
+    use reth_chainspec::ChainSpecBuilder;
+    use reth_ethereum_engine_primitives::EthEngineTypes;
+    use reth_payload_primitives::PayloadTypes;
+    use reth_primitives_traits::Block as _;
+
+    fn payload(extra_data_size: usize) -> ExecutionData {
+        let mut block = Block::default();
+        block.header.base_fee_per_gas = Some(1);
+        block.header.extra_data = vec![42; extra_data_size].into();
+        <EthEngineTypes as PayloadTypes>::block_to_payload(block.seal_slow(), None)
+    }
+
+    #[test]
+    fn chain_extra_data_limit_preserves_hash_and_fork_validation() {
+        let spec = Arc::new(ChainSpecBuilder::mainnet().build());
+        let ethereum = EthereumEngineValidator::new(spec);
+        assert!(<EthereumEngineValidator as PayloadValidator<EthEngineTypes>>::convert_payload_to_block(
+            &ethereum, payload(32)
+        ).is_ok());
+        assert!(matches!(
+            <EthereumEngineValidator as PayloadValidator<EthEngineTypes>>::convert_payload_to_block(
+                &ethereum,
+                payload(33)
+            ),
+            Err(NewPayloadError::Eth(PayloadError::ExtraData(_)))
+        ));
+        let fluent = ethereum.with_max_extra_data_size(65);
+        let fluent: &dyn PayloadValidator<EthEngineTypes, Block = Block> = &fluent;
+        let original = payload(65);
+        let expected_hash = original.block_hash();
+        let block = fluent.convert_payload_to_block(original).unwrap();
+        assert_eq!(block.header().extra_data.len(), 65);
+        assert_eq!(block.hash(), expected_hash);
+        assert!(matches!(
+            fluent.convert_payload_to_block(payload(66)),
+            Err(NewPayloadError::Eth(PayloadError::ExtraData(_)))
+        ));
+        let mut bad_hash = payload(65);
+        bad_hash.payload.as_v1_mut().block_hash = B256::ZERO;
+        assert!(matches!(
+            fluent.convert_payload_to_block(bad_hash),
+            Err(NewPayloadError::Eth(PayloadError::BlockHash { .. }))
+        ));
+
+        // A payload valid before Shanghai must still be rejected when withdrawals are required.
+        let shanghai = EthereumEngineValidator::new(Arc::new(
+            ChainSpecBuilder::mainnet().shanghai_activated().build(),
+        ))
+        .with_max_extra_data_size(65);
+        assert!(<EthereumEngineValidator as PayloadValidator<EthEngineTypes>>::convert_payload_to_block(&shanghai, payload(65)).is_err());
     }
 }
