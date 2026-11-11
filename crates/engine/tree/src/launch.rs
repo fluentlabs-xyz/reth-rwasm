@@ -29,6 +29,39 @@ use reth_storage_overlay::OverlayManager;
 use reth_tasks::Runtime;
 use std::sync::Arc;
 
+/// Process-global escrow for the engine-tree request sender.
+///
+/// The stock launcher consumes the [`ChainOrchestrator`] (and with it the only
+/// route to the tree's `incoming` channel), so an external consensus driver
+/// that imports pre-executed blocks via
+/// [`EngineApiRequest::InsertExecutedBlock`] has no way to reach the tree.
+/// [`EngineOrchestratorBuilder::build`] deposits a clone of the sender here; the
+/// embedding binary takes it once after launch.
+///
+/// Single-node-per-process by design: a second launch overwrites the deposit,
+/// and `take` hands the sender to exactly one caller.
+pub mod tree_sender_escrow {
+    use std::{any::Any, sync::Mutex};
+
+    static ESCROW: Mutex<Option<Box<dyn Any + Send>>> = Mutex::new(None);
+
+    pub(super) fn deposit(sender: Box<dyn Any + Send>) {
+        *ESCROW.lock().expect("tree sender escrow poisoned") = Some(sender);
+    }
+
+    /// Take the deposited sender, downcast to the node's concrete channel
+    /// type. `None` if nothing was deposited, it was already taken, or the
+    /// type does not match the deposited node's engine types.
+    pub fn take<T: 'static>() -> Option<T> {
+        ESCROW
+            .lock()
+            .expect("tree sender escrow poisoned")
+            .take()
+            .and_then(|boxed| boxed.downcast::<T>().ok())
+            .map(|boxed| *boxed)
+    }
+}
+
 /// The [`ChainOrchestrator`] built by [`EngineOrchestratorBuilder`].
 pub type EngineOrchestrator<T, N, Client, S, B> = ChainOrchestrator<
     EngineHandler<
@@ -150,6 +183,7 @@ where
             runtime,
         );
 
+        tree_sender_escrow::deposit(Box::new(to_tree_tx.clone()));
         let engine_handler = EngineApiRequestHandler::new(to_tree_tx, from_tree);
         let handler = EngineHandler::new(engine_handler, downloader, incoming_requests);
 
