@@ -326,6 +326,15 @@ pub struct StaticFileProviderInner<N> {
     path: PathBuf,
     /// Maintains a writer set of [`StaticFileSegment`].
     writers: StaticFileWriters<N>,
+    /// Registry of the fixed block range of the file each segment's active writer currently owns
+    /// (`None` = no active writer).
+    ///
+    /// The cache-miss path consults it to detect (and warn about) a self-load of a file a writer
+    /// may be mid-append on, and [`StaticFileProvider::initialize_index`] uses it to republish
+    /// committed snapshots for active files after clearing [`Self::map`]. Interior mutability
+    /// only: the outer map is populated once at construction; the per-segment locks are written
+    /// on writer open, rotation and drop, and read on a cache miss or a re-initialization.
+    active_writers: StaticFileMap<RwLock<Option<SegmentRangeInclusive>>>,
     /// Metrics for the static files.
     metrics: Option<Arc<StaticFileProviderMetrics>>,
     /// Access rights of the provider.
@@ -352,8 +361,10 @@ impl<N: NodePrimitives> StaticFileProviderInner<N> {
         };
 
         let mut blocks_per_file = StaticFileMap::default();
+        let mut active_writers = StaticFileMap::default();
         for segment in StaticFileSegment::iter() {
             blocks_per_file.insert(segment, DEFAULT_BLOCKS_PER_STATIC_FILE);
+            active_writers.insert(segment, RwLock::new(None));
         }
 
         let provider = Self {
@@ -361,6 +372,7 @@ impl<N: NodePrimitives> StaticFileProviderInner<N> {
             cache_generation: Default::default(),
             indexes: Default::default(),
             writers: Default::default(),
+            active_writers,
             earliest_history_height: Default::default(),
             path: path.as_ref().to_path_buf(),
             metrics: None,
@@ -447,6 +459,36 @@ impl<N: NodePrimitives> StaticFileProviderInner<N> {
     /// Get genesis block number
     pub const fn genesis_block_number(&self) -> u64 {
         self.genesis_block_number
+    }
+}
+
+impl<N> StaticFileProviderInner<N> {
+    /// Records that `segment`'s active writer now owns the file spanning `range` (the
+    /// publish-on-open ownership signal).
+    pub(crate) fn mark_active_writer_file(
+        &self,
+        segment: StaticFileSegment,
+        range: SegmentRangeInclusive,
+    ) {
+        if let Some(slot) = self.active_writers.get(segment) {
+            *slot.write() = Some(range);
+        }
+    }
+
+    /// Clears `segment`'s active-writer registry entry (writer released / dropped).
+    pub(crate) fn clear_active_writer_file(&self, segment: StaticFileSegment) {
+        if let Some(slot) = self.active_writers.get(segment) {
+            *slot.write() = None;
+        }
+    }
+
+    /// Returns the fixed block range of the file `segment`'s active writer currently owns, or
+    /// `None` if no writer is active on the segment.
+    pub(crate) fn active_writer_file_range(
+        &self,
+        segment: StaticFileSegment,
+    ) -> Option<SegmentRangeInclusive> {
+        *self.active_writers.get(segment)?.read()
     }
 }
 
@@ -1017,6 +1059,24 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         } else {
             let generation = self.cache_generation.load(Ordering::Acquire);
             trace!(target: "providers::static_file", ?segment, ?fixed_block_range, generation, "Creating jar from scratch");
+
+            // A miss on the active writer file is normally impossible (publish-on-open,
+            // publish-on-commit and republish-on-reinit keep its committed snapshot cached), but
+            // a path that drops the cached entry without republishing reaches it. It is served by
+            // the self-load below, never refused: a refusal would wedge the engine read path.
+            // `LoadedJar::new` validates the captured snapshot against the committed `rows` or
+            // fails with a retryable error, so the self-load never caches a torn view.
+            if self.active_writer_file_range(segment).map(|range| range.end()) ==
+                Some(fixed_block_range.end())
+            {
+                warn!(
+                    target: "providers::static_file",
+                    ?segment,
+                    ?fixed_block_range,
+                    "Cache miss on the active writer file; serving a validated self-load"
+                );
+            }
+
             let path = self.path.join(segment.filename(fixed_block_range));
             let jar = NippyJar::load(&path).map_err(ProviderError::other)?;
             let loaded = LoadedJar::new(jar)?;
@@ -1245,6 +1305,43 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         Ok(())
     }
 
+    /// Publishes a committed snapshot of the file `fixed_range` belongs to into the shared cache
+    /// and records it as `segment`'s active-writer file.
+    ///
+    /// Called by [`StaticFileProviderRW`] whenever it opens or rotates onto a writable jar, so
+    /// the shared map always holds a committed snapshot for the active file. Together with
+    /// publish-on-commit ([`Self::update_index`]) this makes every cached entry a committed
+    /// snapshot, so a reader never misses on — and never self-loads — a file with an active
+    /// writer.
+    ///
+    /// Unlike [`Self::update_index`] this does not touch the block/tx indexes: a freshly opened
+    /// or just-rotated file has no newly committed rows to route reads to.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the jar cannot be loaded or its snapshot fails validation.
+    pub fn publish_writer_snapshot(
+        &self,
+        segment: StaticFileSegment,
+        fixed_range: SegmentRangeInclusive,
+    ) -> ProviderResult<()> {
+        // Ownership first: a reader that misses the cache during the load below then knows it
+        // races an active writer.
+        self.mark_active_writer_file(segment, fixed_range);
+
+        let path = self.path.join(segment.filename(&fixed_range));
+        let jar = NippyJar::<SegmentHeader>::load(&path).map_err(ProviderError::other)?;
+        self.map.insert((fixed_range.end(), segment), LoadedJar::new(jar)?);
+
+        debug!(
+            target: "providers::static_file",
+            ?segment,
+            ?fixed_range,
+            "Published committed snapshot for active writer file"
+        );
+        Ok(())
+    }
+
     /// Initializes the inner transaction and block index
     pub fn initialize_index(&self) -> ProviderResult<()> {
         let mut indexes = self.indexes.write();
@@ -1292,6 +1389,17 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         // publishes before the clear reaches that shard and is removed by it.
         self.cache_generation.fetch_add(1, Ordering::AcqRel);
         self.map.clear();
+
+        // A writer stays registered across the clear, and its next commit may never come when
+        // reads fail meanwhile (genesis bring-up), so each active file's committed snapshot is
+        // republished now. An active file deleted by the caller (`delete_segment`) is skipped.
+        for segment in StaticFileSegment::iter() {
+            if let Some(fixed_range) = self.active_writer_file_range(segment) &&
+                self.path.join(segment.filename(&fixed_range)).exists()
+            {
+                self.publish_writer_snapshot(segment, fixed_range)?;
+            }
+        }
 
         // initialize the expired history height to the lowest static file block
         if let Some(lowest_range) =
@@ -3165,6 +3273,9 @@ mod tests {
             writer.append_header(&header_0, &hash_0)?;
             writer.commit()?;
         }
+        // Reinitialization republishes an active writer's snapshot, which would serve the
+        // reads below from the cache; release the writer so they take the cache-fill path.
+        static_files.writers.remove(StaticFileSegment::Headers);
 
         // Create two receipt jars. Deleting either one reinitializes every segment index and
         // invalidates the shared jar cache, matching the pruning path from the incidents.
@@ -3203,6 +3314,7 @@ mod tests {
             writer.append_header(&header_1, &hash_1)?;
             writer.commit()?;
         }
+        static_files.writers.remove(StaticFileSegment::Headers);
         static_files.delete_jar(StaticFileSegment::Receipts, 2)?;
 
         resume_tx.send(()).expect("reader dropped before cache publication");
@@ -3227,6 +3339,9 @@ mod tests {
             writer.append_header(&Header::default(), &hash)?;
             writer.commit()?;
         }
+        // Reinitialization republishes an active writer's snapshot; release the writer so the
+        // cache must stay empty after the clear below.
+        static_files.writers.remove(StaticFileSegment::Headers);
         static_files.remove_cached_provider(StaticFileSegment::Headers, 9);
 
         let generation = static_files.cache_generation.load(Ordering::Acquire);

@@ -15,7 +15,10 @@ mod metrics;
 #[cfg(test)]
 mod writer_tests;
 
-use reth_nippy_jar::NippyJar;
+#[cfg(test)]
+mod snapshot_tests;
+
+use reth_nippy_jar::{NippyJar, NippyJarError};
 use reth_static_file_types::{ChangesetOffsetReader, SegmentHeader, StaticFileSegment};
 use reth_storage_errors::provider::{ProviderError, ProviderResult};
 use std::{io, ops::Deref, sync::Arc};
@@ -33,27 +36,85 @@ pub struct LoadedJar {
 }
 
 impl LoadedJar {
+    /// Opens the readers of `jar` and validates the captured snapshot.
+    ///
+    /// A jar loaded off a file a concurrent writer is mid-append on can capture an
+    /// offsets/data/sidecar triple that does not cover its committed row count. On the first
+    /// validation failure the jar is reloaded from disk once (absorbing a transient race); a
+    /// second failure surfaces as a typed, retryable [`NippyJarError::InconsistentSnapshot`]
+    /// instead of a torn view cached for every later read.
     fn new(jar: NippyJar<SegmentHeader>) -> ProviderResult<Self> {
-        match jar.open_data_reader() {
-            Ok(data_reader) => {
-                let mmap_handle = Arc::new(data_reader);
-
-                let csoff_reader = if jar.user_header().segment().is_change_based() {
-                    let csoff_path = jar.data_path().with_extension("csoff");
-                    let len = jar.user_header().changeset_offsets_len();
-                    match ChangesetOffsetReader::new(&csoff_path, len) {
-                        Ok(reader) => Some(reader),
-                        Err(err) if err.kind() == io::ErrorKind::NotFound && len == 0 => None,
-                        Err(err) => return Err(ProviderError::other(err)),
-                    }
-                } else {
-                    None
-                };
-
-                Ok(Self { jar, mmap_handle, csoff_reader })
+        let data_path = jar.data_path().to_path_buf();
+        match Self::load_validated(jar) {
+            Ok(loaded) => Ok(loaded),
+            Err(_first) => {
+                let jar = NippyJar::load(&data_path).map_err(ProviderError::other)?;
+                Self::load_validated(jar).map_err(ProviderError::other)
             }
-            Err(e) => Err(ProviderError::other(e)),
         }
+    }
+
+    /// Opens the mmap and changeset-sidecar readers for `jar` and checks that they cover the
+    /// committed row count.
+    ///
+    /// Every check follows from the format's durable commit order (data, then offsets, then the
+    /// config holding `rows`; for changeset segments the sidecar is synced before the config), so
+    /// it holds for every committed file, empty ones included, and trips only on a torn read or
+    /// on corruption.
+    fn load_validated(jar: NippyJar<SegmentHeader>) -> Result<Self, NippyJarError> {
+        let data_reader = jar.open_data_reader()?;
+
+        // One offset per committed value plus the terminal offset.
+        let expected_offsets = jar.rows() * jar.columns() + 1;
+        let offsets_count = data_reader.offsets_count()?;
+        if offsets_count < expected_offsets {
+            return Err(NippyJarError::InconsistentSnapshot {
+                reason: format!(
+                    "offsets count {offsets_count} < expected {expected_offsets} \
+                     (rows {}, columns {})",
+                    jar.rows(),
+                    jar.columns(),
+                ),
+            });
+        }
+
+        let last_offset = data_reader.reverse_offset(0)? as usize;
+        let data_len = data_reader.size();
+        if last_offset > data_len {
+            return Err(NippyJarError::InconsistentSnapshot {
+                reason: format!("terminal offset {last_offset} > data size {data_len}"),
+            });
+        }
+
+        let csoff_reader = if jar.user_header().segment().is_change_based() {
+            let csoff_path = jar.data_path().with_extension("csoff");
+            let len = jar.user_header().changeset_offsets_len();
+            match ChangesetOffsetReader::new(&csoff_path, len) {
+                Ok(reader) => {
+                    if let Some(last) = len.checked_sub(1) {
+                        match reader.get(last) {
+                            Ok(_) => {}
+                            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
+                                return Err(NippyJarError::InconsistentSnapshot {
+                                    reason: format!(
+                                        "changeset sidecar shorter than its {len} committed \
+                                         records"
+                                    ),
+                                })
+                            }
+                            Err(err) => return Err(NippyJarError::Disconnect(err)),
+                        }
+                    }
+                    Some(reader)
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound && len == 0 => None,
+                Err(err) => return Err(NippyJarError::Disconnect(err)),
+            }
+        } else {
+            None
+        };
+
+        Ok(Self { jar, mmap_handle: Arc::new(data_reader), csoff_reader })
     }
 
     /// Returns a clone of the mmap handle that can be used to instantiate a cursor.
