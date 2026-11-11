@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{ops::Range, path::PathBuf};
 use thiserror::Error;
 
 /// Errors associated with [`crate::NippyJar`].
@@ -65,6 +65,15 @@ pub enum NippyJarError {
         index: usize,
     },
 
+    /// An attempt was made to read a data range that is inverted or out of bounds.
+    #[error("attempted to read an inconsistent data range {range:?}, data size: {len}")]
+    InconsistentData {
+        /// The requested data range.
+        range: Range<usize>,
+        /// The total size of the data file.
+        len: usize,
+    },
+
     /// The output buffer is too small for the compression or decompression operation.
     #[error("compression or decompression requires a bigger destination output")]
     OutputTooSmall,
@@ -88,6 +97,16 @@ pub enum NippyJarError {
     /// The file is in an inconsistent state.
     #[error("File is in an inconsistent state.")]
     InconsistentState,
+
+    /// A snapshot captured for reading was not internally consistent with the committed row
+    /// count. This is a transient race against a concurrent writer mid-append (readers observing
+    /// a file before its offsets/data/sidecar are fully published) or, failing a reload, genuine
+    /// corruption. Callers should treat it as retryable.
+    #[error("inconsistent static-file snapshot: {reason}")]
+    InconsistentSnapshot {
+        /// Human-readable description of which load-time invariant failed.
+        reason: String,
+    },
 
     /// A specified file is missing.
     #[error("Missing file: {}", .0.display())]

@@ -97,9 +97,9 @@ impl<'a, H: NippyJarHeader> NippyJarCursor<'a, H> {
             row.into_iter()
                 .map(|v| match v {
                     ValueRange::Mmap(range) => self.reader.data(range),
-                    ValueRange::Internal(range) => &self.internal_buffer[range],
+                    ValueRange::Internal(range) => Ok(&self.internal_buffer[range]),
                 })
-                .collect(),
+                .collect::<Result<RefRow<'_>, _>>()?,
         ))
     }
 
@@ -138,9 +138,9 @@ impl<'a, H: NippyJarHeader> NippyJarCursor<'a, H> {
             row.into_iter()
                 .map(|v| match v {
                     ValueRange::Mmap(range) => self.reader.data(range),
-                    ValueRange::Internal(range) => &self.internal_buffer[range],
+                    ValueRange::Internal(range) => Ok(&self.internal_buffer[range]),
                 })
-                .collect(),
+                .collect::<Result<RefRow<'_>, _>>()?,
         ))
     }
 
@@ -150,13 +150,11 @@ impl<'a, H: NippyJarHeader> NippyJarCursor<'a, H> {
         let offset_pos = self.row as usize * self.jar.columns + column;
         let value_offset = self.reader.offset(offset_pos)? as usize;
 
-        let column_offset_range = if self.jar.rows * self.jar.columns == offset_pos + 1 {
-            // It's the last column of the last row
-            value_offset..self.reader.size()
-        } else {
-            let next_value_offset = self.reader.offset(offset_pos + 1)? as usize;
-            value_offset..next_value_offset
-        };
+        // The value ends at the next offset; for the last committed value that is the terminal
+        // offset, never the data file's length, which a writer's uncommitted append moves ahead
+        // of it.
+        let next_value_offset = self.reader.offset(offset_pos + 1)? as usize;
+        let column_offset_range = value_offset..next_value_offset;
 
         if let Some(compression) = self.jar.compressor() {
             // The decompressors write into the spare capacity of the buffer, so it has to fit any
@@ -177,7 +175,7 @@ impl<'a, H: NippyJarHeader> NippyJarCursor<'a, H> {
                         .expect("dictionary to be loaded");
                     let mut decompressor = Decompressor::with_prepared_dictionary(dictionaries)?;
                     Zstd::decompress_with_dictionary(
-                        self.reader.data(column_offset_range),
+                        self.reader.data(column_offset_range)?,
                         &mut self.internal_buffer,
                         &mut decompressor,
                     )?;
@@ -185,7 +183,7 @@ impl<'a, H: NippyJarHeader> NippyJarCursor<'a, H> {
                 _ => {
                     // Uses the chosen default decompressor
                     compression.decompress_to(
-                        self.reader.data(column_offset_range),
+                        self.reader.data(column_offset_range)?,
                         &mut self.internal_buffer,
                     )?;
                 }
