@@ -1602,13 +1602,20 @@ where
                 match request {
                     EngineApiRequest::InsertExecutedBlock(payload) => {
                         let block_num_hash = payload.recovered_block.num_hash();
-                        if block_num_hash.number <= self.state.tree_state.canonical_block_number() {
-                            // outdated block that can be skipped
-                            return Ok(ops::ControlFlow::Continue(()))
-                        }
-
-                        if self.state.tree_state.contains_hash(&block_num_hash.hash) {
-                            // block already known to the tree (e.g. delivered via newPayload first)
+                        // Skip only blocks that are already known: in the tree (e.g.
+                        // delivered via newPayload first) or persisted to the DB. A
+                        // height-only `number <= canonical_block_number()` gate would also
+                        // drop a same-height sibling of the canonical head, which an
+                        // external consensus imports to reorg onto its finalized fork; the
+                        // follow-up FCU would then stay SYNCING on the unknown head hash.
+                        let already_known =
+                            self.state.tree_state.contains_hash(&block_num_hash.hash) ||
+                                (block_num_hash.number <=
+                                    self.persistence_state.last_persisted_block.number &&
+                                    self.provider
+                                        .sealed_header_by_hash(block_num_hash.hash)
+                                        .is_ok_and(|header| header.is_some()));
+                        if already_known {
                             return Ok(ops::ControlFlow::Continue(()))
                         }
 

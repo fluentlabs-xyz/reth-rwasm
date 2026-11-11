@@ -50,6 +50,8 @@ use std::{
 };
 use tokio::sync::oneshot;
 
+mod insert_executed_block;
+
 /// Wraps blocks as if they had been downloaded without any access list data.
 fn downloaded_blocks<B: reth_primitives_traits::Block>(
     blocks: Vec<reth_primitives_traits::SealedBlock<B>>,
